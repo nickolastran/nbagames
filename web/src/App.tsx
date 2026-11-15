@@ -1,38 +1,29 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import type { Session } from "@supabase/supabase-js";
-import { SignIn, configured, handleOf, supabase, useSession } from "./auth";
-import Landing from "./Landing";
+import { useEffect, useRef, useState } from "react";
+import Landing, { Ball } from "./Landing";
 
 /* ---------- api ---------- */
 
-export type Game = {
-  id: number; date: string; opp: string; home: boolean;
-  team_score: number; opp_score: number; min: number;
-  pts: number; reb: number; ast: number; stl: number; blk: number;
-  fg3m: number; fg3a: number; tov: number;
-  accolades: string[];
+type Side = { abbr: string; name: string; score: number };
+/** A game you were at: the box-score snapshot /api/game/{id} returns, stored as-is. */
+type Stored = {
+  id: string; date: string; playoff: boolean; periods: number; venue: string; city: string;
+  home: Side; away: Side; players: unknown[];
 };
-type GameRef = { date: string; opp: string; opp_name: string; home: boolean };
-export type Summary = {
-  handle: string;
-  totals: { games: number; record: string; pts: number; reb: number; ast: number; ppg: number };
-  accolades: { key: string; label: string; count: number }[];
-  records: { key: string; label: string; value: number; game: GameRef | null }[];
-  splits: { label: string; record: string; games: number; pts: number; ppg: number; rpg: number; apg: number }[];
-  leaders: { key: string; label: string; top: (GameRef & { value: number })[] }[];
-  teams: { abbr: string; name: string; color: string; w: number; l: number; txt: string; played: number }[];
-  milestones: { title: string; done: boolean; mark: string | null; detail: string }[];
-  games: Game[];
+type Seen = Stored & { badges: string[] };
+type Badge = { key: string; label: string; rarity: number | null; count: number; progress?: string | null };
+type Board = { key: string; label: string; col: string; top: { name: string; team: string; value: number }[] };
+type Summary = {
+  totals: { games: number; points: number; players: number; teams: number; arenas: number };
+  badges: Badge[];
+  records: { label: string; value: string; sub: string }[];
+  teams: { abbr: string; name: string; color: string; w: number; l: number; games: number }[];
+  arenas: { venue: string; city: string; games: number }[];
+  leaders: Board[];
+  milestones: { title: string; done: boolean; mark: string; detail: string }[];
+  games: Seen[];
 };
-type Filter = { acc: string | null; team: string | null };
-
-/** One team's view of a real NBA game found by search — exactly what the add form needs. */
-type Side = {
-  abbr: string; name: string; home: boolean;
-  team_score: number; opp: string; opp_name: string; opp_score: number;
-};
-type Found = { date: string; label: string; final: boolean; sides: Side[] };
-type Prefill = Side & { date: string };
+type Filter = { badge: string | null; team: string | null };
+type Found = { id: string; date: string; final: boolean; periods: number; home: Side; away: Side };
 
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`/api${path}`, {
@@ -43,22 +34,35 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
     const body = await res.text();
     let detail = body;
     try { detail = (JSON.parse(body) as { detail?: string }).detail ?? body; } catch { /* not json */ }
-    throw new Error(detail || res.statusText);
+    throw new Error(typeof detail === "string" ? detail : "Some games in there aren't valid");
   }
-  return res.status === 204 ? (undefined as T) : res.json();
+  return res.json();
+}
+const summarize = (games: Stored[], filter?: Filter) =>
+  call<Summary>("/summary", { method: "POST", body: JSON.stringify({ games, ...filter }) });
+
+/* ---------- local storage: no account, games live in this browser ---------- */
+
+type Store = { handle: string; games: Stored[] };
+const KEY = "nbagames.v2";
+
+function loadStore(): Store {
+  try {
+    const s = JSON.parse(localStorage.getItem(KEY) ?? "null");
+    if (s && Array.isArray(s.games)) return { handle: String(s.handle ?? ""), games: s.games };
+  } catch { /* blocked or corrupt storage: start clean */ }
+  return { handle: "", games: [] };
 }
 
 /* ---------- helpers ---------- */
 
-const PAGE = 25;
-const fmtDate = (s: string) =>
-  new Date(`${s}T00:00:00`).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "2-digit" });
-const at = (g: { home: boolean }) => (g.home ? "vs" : "@");
-const label = (s: Summary, key: string) => s.accolades.find((a) => a.key === key)?.label ?? key;
+const PAGE = 10;
+const day = (s: string, opts: Intl.DateTimeFormatOptions) => new Date(`${s}T00:00:00`).toLocaleDateString("en-US", opts);
+const fmtDate = (s: string) => day(s, { month: "short", day: "numeric", year: "numeric" });
+const fmtDay = (s: string) => day(s, { weekday: "short", month: "short", day: "numeric" });
+const isDate = (s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s);
+const otLabel = (p: number) => (p === 5 ? "OT" : `${p - 4}OT`);
 
-/* ---------- app ---------- */
-
-/** Routing is one hash: "#login" is the only route, everything else is the landing page. */
 function useHash() {
   const [hash, setHash] = useState(() => location.hash.slice(1));
   useEffect(() => {
@@ -69,425 +73,372 @@ function useHash() {
   return hash;
 }
 
+/** "#app" is the tracker; everything else (including in-page anchors) is the landing page. */
 export default function App() {
-  const { session, ready } = useSession();
-  const route = useHash();
-
-  if (!ready) return <div className="wrap"><p className="loading">Loading…</p></div>;
-  if (session) return <Tracker session={session} key={session.user.id} />;
-  if (route !== "login") return <Landing />;
-  if (!configured)
-    return (
-      <div className="wrap">
-        <p className="error">
-          Supabase isn’t configured. Copy <code>web/.env.example</code> to <code>web/.env.local</code>,
-          paste your project URL and anon key, and restart <code>npm run dev</code>.
-        </p>
-        <p><a href="#">&larr; Back</a></p>
-      </div>
-    );
-  return <SignIn />;
+  return useHash() === "app" ? <Tracker /> : <Landing />;
 }
 
-function Tracker({ session }: { session: Session }) {
+const Title = ({ handle, onClick }: { handle: string; onClick: () => void }) => (
+  <h1><button className="plain" onClick={onClick} title="Click to rename">
+    {handle ? <><em>{handle}</em>&rsquo;s Games</> : <>My <em>Games</em></>}
+  </button></h1>
+);
+
+/** "Celtics 103 @ Heat 91 (OT)", winner in bold — the reference's box-score line. */
+function Matchup({ g }: { g: { home: Side; away: Side; periods: number } }) {
+  const homeWon = g.home.score > g.away.score;
+  return (
+    <span className="mu">
+      <span className={homeWon ? "" : "win"}>{g.away.name} {g.away.score}</span>
+      {" @ "}
+      <span className={homeWon ? "win" : ""}>{g.home.name} {g.home.score}</span>
+      {g.periods > 4 && <span className="ot"> ({otLabel(g.periods)})</span>}
+    </span>
+  );
+}
+
+function BadgePill({ b, pressed, onClick }: { b: Badge; pressed?: boolean; onClick?: () => void }) {
+  const note = b.rarity ? `1 in ${b.rarity} games` : b.count ? null : b.progress;
+  return (
+    <button className="badge" data-earned={b.count ? 1 : 0} disabled={!onClick || !b.count || !b.rarity}
+      aria-pressed={pressed} onClick={onClick}>
+      ★ {b.label}
+      {b.count > 1 && <span className="ct">×{b.count}</span>}
+      {note && <span className="rar">{note}</span>}
+    </button>
+  );
+}
+
+/* ---------- tracker ---------- */
+
+function Tracker() {
+  const [store, setStore] = useState(loadStore);
   const [data, setData] = useState<Summary | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState<Filter>({ acc: null, team: null });
-  const [page, setPage] = useState(0);
+  const [storageOk, setStorageOk] = useState(true);
+  const [filter, setFilter] = useState<Filter>({ badge: null, team: null });
   const [showAll, setShowAll] = useState(false);
-  const [prefill, setPrefill] = useState<Prefill | null>(null);
-  const [adding, setAdding] = useState(false);
-  const ledgerRef = useRef<HTMLElement>(null);
+  const [allTeams, setAllTeams] = useState(false);
+  const [allBadges, setAllBadges] = useState(false);
+  const [entering, setEntering] = useState(false);
+  const gamesRef = useRef<HTMLElement>(null);
 
-  const reload = useCallback(async () => {
-    const { data: rows, error } = await supabase
-      .from("games").select("*").order("date", { ascending: false });
-    if (error) return setError(error.message);
-    const summary = await call<Summary>("/summary", {
-      method: "POST",
-      body: JSON.stringify({ handle: handleOf(session), games: rows ?? [], ...filter }),
-    }).catch((e: Error) => { setError(e.message); return null; });
-    if (summary) { setData(summary); setError(null); }
-  }, [filter, session]);
-  useEffect(() => { void reload(); }, [reload]);
+  useEffect(() => { scrollTo(0, 0); }, []);
+  useEffect(() => {
+    try { localStorage.setItem(KEY, JSON.stringify(store)); setStorageOk(true); }
+    catch { setStorageOk(false); }
+  }, [store]);
+  useEffect(() => {
+    let live = true;
+    summarize(store.games, filter)
+      .then((s) => { if (live) { setData(s); setError(null); } })
+      .catch((e: Error) => { if (live) setError(e.message); });
+    return () => { live = false; };
+  }, [store.games, filter]);
 
+  const have = new Set(store.games.map((g) => g.id));
+  const add = async (id: string) => {
+    const g = await call<Stored>(`/game/${id}`);
+    setStore((s) => (s.games.some((x) => x.id === g.id) ? s : { ...s, games: [...s.games, g] }));
+  };
   const toggle = (key: keyof Filter, value: string) => {
     setFilter((f) => ({ ...f, [key]: f[key] === value ? null : value }));
-    setPage(0);
-    ledgerRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    gamesRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+  const remove = (id: string) => {
+    if (confirm("Remove this game?")) setStore((s) => ({ ...s, games: s.games.filter((g) => g.id !== id) }));
+  };
+  const rename = () => {
+    const h = prompt("Your name (leave blank for “My Games”)", store.handle);
+    if (h !== null) setStore((s) => ({ ...s, handle: h.trim().slice(0, 24) }));
+  };
+  const exportGames = () => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(store)], { type: "application/json" }));
+    a.download = "my-games.json";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+  const importGames = async (file: File) => {
+    try {
+      const s = JSON.parse(await file.text());
+      const games: Stored[] = Array.isArray(s) ? s : s?.games;
+      if (!Array.isArray(games)) throw new Error("no games in that file");
+      await summarize(games); // the API validates every game before we keep any of them
+      if (store.games.length && !confirm(`Replace your ${store.games.length} games with ${games.length} from the file?`)) return;
+      setStore({ handle: String(s.handle ?? store.handle), games });
+    } catch (e) {
+      setError(`Import failed: ${(e as Error).message}`);
+    }
   };
 
-  const removeGame = async (id: number) => {
-    const { error } = await supabase.from("games").delete().eq("id", id);
-    if (error) return setError(error.message);
-    void reload();
-  };
+  const top = (
+    <nav className="topbar">
+      <a href="#" className="logo"><Ball /><span>Game<b>Tracker</b></span></a>
+      <span className="tools">
+        <label className="ghost">Import<input type="file" accept="application/json,.json" hidden
+          onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void importGames(f); }} /></label>
+        {!!store.games.length && <button className="ghost" onClick={exportGames}>Export</button>}
+      </span>
+    </nav>
+  );
+  const notes = (
+    <>
+      {error && <p className="err">{error}</p>}
+      {!storageOk && <p className="err">This browser is blocking storage — games won’t be kept after you leave. Export before closing.</p>}
+    </>
+  );
 
-  const rename = async (h: string) => {
-    await supabase.auth.updateUser({ data: { handle: h.trim().slice(0, 24) || "Handy" } });
-    void reload();
-  };
+  if (!data) {
+    return <div className="app"><div className="page">{top}{notes}{!error && <p className="muted center">Loading…</p>}</div></div>;
+  }
 
-  const startLogging = (p: Prefill) => {
-    setPrefill(p);
-    setAdding(true);
-    ledgerRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  };
+  /* ----- empty: the "My Games" start screen ----- */
+  if (!store.games.length) {
+    const starters = data.badges.filter((b) => !b.rarity || ["td", "ot", "po"].includes(b.key));
+    return (
+      <div className="app"><div className="page">
+        {top}{notes}
+        <section className="green intro">
+          <span className="kicker">★ Every game you’ve seen live</span>
+          <Title handle={store.handle} onClick={rename} />
+          <p className="lede">
+            Build your personal scoreboard for all the NBA games you’ve been to. Get your own
+            unique stats, records and highlights.
+          </p>
+          <GameSearch have={have} onAdd={add} />
+          <p className="hint">Add games you’ve been to to earn your first badges</p>
+          <div className="badges">{starters.map((b) => <BadgePill key={b.key} b={b} />)}</div>
+        </section>
+        <section className="box">
+          <h2>Your Games</h2>
+          <p className="muted">No games yet — find your first one above.</p>
+        </section>
+      </div></div>
+    );
+  }
 
-  if (error) return <div className="wrap"><p className="error">{error}</p></div>;
-  if (!data) return <div className="wrap"><p className="loading">Loading your games…</p></div>;
-
-  const empty = data.totals.games === 0;
+  /* ----- populated: the stat page ----- */
   const list = data.games;
-  const start = showAll ? 0 : page * PAGE;
-  const view = showAll ? list : list.slice(start, start + PAGE);
+  const earned = data.badges.filter((b) => b.count);
+  const teams = allTeams ? data.teams : data.teams.slice(0, 15);
+  const years = [...new Set(list.map((g) => g.date.slice(0, 4)))];
+  const row = (g: Seen, long: boolean) => (
+    <div className="gm" key={g.id}>
+      <span className="dt">{long ? fmtDate(g.date) : fmtDay(g.date)}</span>
+      <span className="mid">
+        <Matchup g={g} />
+        {!!g.badges.length && (
+          <span className="tags">
+            {g.badges.map((k) => <span key={k}>★ {data.badges.find((b) => b.key === k)?.label}</span>)}
+          </span>
+        )}
+      </span>
+      <button className="del" aria-label={`Remove ${g.away.name} at ${g.home.name} on ${fmtDate(g.date)}`}
+        title="Remove game" onClick={() => remove(g.id)}>×</button>
+    </div>
+  );
 
   return (
-    <div className="wrap">
-      <Masthead handle={data.handle} email={session.user.email ?? ""} onRename={(h) => void rename(h)} />
+    <div className="app"><div className="page">
+      {top}{notes}
 
-      {empty ? (
-        <section className="panel blank">
-          <h2>Nothing logged yet <span className="eyebrow">Clean slate</span></h2>
-          <div className="body">
-            <p>
-              Search the NBA game logs below, pick the side you played, and add your stat line.
-              Every game you log is scanned for accolades — triple-doubles, 40-point nights,
-              perfect shooting — and your records, splits and milestones build from there.
-            </p>
+      <header className="green">
+        <div className="green-top">
+          <div className="hero-copy">
+            <span className="kicker">★ Every game you’ve seen live</span>
+            <Title handle={store.handle} onClick={rename} />
           </div>
-        </section>
-      ) : (
-        <>
-          <section className="scoreboard">
+          <div className="totals">
             {([
-              ["Games Logged", data.totals.games],
-              ["Record", data.totals.record],
-              ["Points", data.totals.pts.toLocaleString()],
-              ["Rebounds", data.totals.reb],
-              ["Assists", data.totals.ast],
-              ["PPG", data.totals.ppg.toFixed(1)],
-            ] as const).map(([l, v]) => (
-              <div key={l}><span className="num">{v}</span><span className="lbl">{l}</span></div>
-            ))}
-          </section>
-
-          <section>
-            <p className="eyebrow mb10">Accolades — tap to filter</p>
-            <div className="chips">
-              {data.accolades.map((a) => (
-                <button key={a.key} className="chip" data-empty={a.count ? 0 : 1}
-                  aria-pressed={filter.acc === a.key} onClick={() => toggle("acc", a.key)}>
-                  {a.label}<span className="ct">{a.count}</span>
-                </button>
-              ))}
-            </div>
-          </section>
-
-          <div className="grid">
-            <section className="panel">
-              <h2>Single Game Records <span className="eyebrow">Career bests</span></h2>
-              <div className="body"><div className="rows">
-                {data.records.map((r) => (
-                  <div className="row" key={r.key}>
-                    <span className="k">{r.label}
-                      {r.game && <><br /><span className="sub">{at(r.game)} {r.game.opp_name} · {fmtDate(r.game.date)}</span></>}
-                    </span>
-                    <span className="v">{r.game ? r.value : "—"}</span>
-                  </div>
-                ))}
-              </div></div>
-            </section>
-
-            <section className="panel">
-              <h2>Milestones <span className="eyebrow">First &amp; furthest</span></h2>
-              <div className="body">
-                {data.milestones.map((m, i) => (
-                  <div className={`ms${m.done ? "" : " locked"}`} key={i}>
-                    <span className="mk">{m.done && m.mark ? fmtDate(m.mark) : m.mark ?? "—"}</span>
-                    <span><span className="mt">{m.title}</span><br /><span className="md">{m.detail}</span></span>
-                  </div>
-                ))}
-              </div>
-            </section>
+              ["Games", data.totals.games], ["Points", data.totals.points.toLocaleString()],
+              ["Players", data.totals.players], ["Teams", data.totals.teams], ["Arenas", data.totals.arenas],
+            ] as const).map(([l, v]) => <div key={l}><b>{v}</b><span>{l}</span></div>)}
           </div>
-
-          <section className="panel">
-            <h2>Home &amp; Away <span className="eyebrow">Split by venue</span></h2>
-            <div className="split">
-              {data.splits.map((s) => (
-                <div key={s.label}>
-                  <h3>{s.label}</h3>
-                  <div className="kv"><span>Record</span><b>{s.record}</b></div>
-                  <div className="kv"><span>Games</span><b>{s.games}</b></div>
-                  <div className="kv"><span>Points per game</span><b>{s.ppg.toFixed(1)}</b></div>
-                  <div className="kv"><span>Rebounds per game</span><b>{s.rpg.toFixed(1)}</b></div>
-                  <div className="kv"><span>Assists per game</span><b>{s.apg.toFixed(1)}</b></div>
-                  <div className="kv"><span>Total points</span><b>{s.pts}</b></div>
-                </div>
-              ))}
-            </div>
-          </section>
-
-          <section className="panel">
-            <h2>Leader Boards <span className="eyebrow">Top 5 games</span></h2>
-            <div className="grid grid-flush">
-              {data.leaders.map((b) => (
-                <div className="leader-col" key={b.key}>
-                  <h3>Most {b.label}</h3>
-                  <div className="rows">
-                    {b.top.map((g, i) => (
-                      <div className="row" key={`${g.date}-${i}`}>
-                        <span className="rank">{i + 1}</span>
-                        <span className="k">{at(g)} {g.opp_name}<br /><span className="sub">{fmtDate(g.date)}</span></span>
-                        <span className="v">{g.value}</span>
-                      </div>
-                    ))}
-                    {!b.top.length && <p className="sub">No games yet.</p>}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </section>
-
-          <section className="panel">
-            <h2>Record vs. Every Team <span className="eyebrow">Tap a team to filter</span></h2>
-            <div className="teams">
-              {data.teams.map((t) => (
-                <button key={t.abbr} className="team" data-none={t.played ? 0 : 1}
-                  aria-pressed={filter.team === t.abbr} style={{ ["--tc" as string]: t.color }}
-                  onClick={() => toggle("team", t.abbr)}>
-                  <span className="dot" />
-                  <span className="nm">{t.name}<small>{t.abbr}</small></span>
-                  <span className="rec">{t.txt}</span>
-                </button>
-              ))}
-            </div>
-          </section>
-        </>
-      )}
-
-      <section className="panel" ref={ledgerRef}>
-        <h2>Your Games <span className="eyebrow">{data.totals.games} logged</span></h2>
-
-        <GameSearch onPick={startLogging} />
-
-        {(filter.acc || filter.team) && (
-          <div className="filterbar">
-            <span>
-              Filtered by {[filter.acc && label(data, filter.acc),
-                filter.team && `vs ${data.teams.find((t) => t.abbr === filter.team)?.name}`]
-                .filter(Boolean).map((s, i) => <b key={i}>{i ? " + " : ""}{s}</b>)}
-              {" "}— {list.length} game{list.length === 1 ? "" : "s"}
-            </span>
-            <button className="btn" onClick={() => { setFilter({ acc: null, team: null }); setPage(0); }}>Clear</button>
-          </div>
-        )}
-
-        <div className="ledger">
-          {view.map((g) => {
-            const team = data.teams.find((t) => t.abbr === g.opp)!;
-            const win = g.team_score > g.opp_score;
-            return (
-              <div className="game" key={g.id} style={{ ["--tc" as string]: team.color }}>
-                <span className="dt">{fmtDate(g.date)}</span>
-                <span className="opp">
-                  <span className="bar" />
-                  <span>
-                    <b><span className="loc">{at(g)}</span>{team.name}</b>
-                    <span className="line">
-                      {g.pts} PTS · {g.reb} REB · {g.ast} AST · {g.stl} STL · {g.blk} BLK · {g.fg3m}/{g.fg3a} 3PT · {g.tov} TO
-                    </span>
-                  </span>
-                </span>
-                <span className="sc">
-                  <span className="n">{g.team_score}–{g.opp_score}</span>
-                  <span className={`res ${win ? "W" : "L"}`}>{win ? "W" : "L"}</span>
-                </span>
-                <span className="tags">
-                  {g.accolades.map((k) => <span className="tag" key={k}>{label(data, k)}</span>)}
-                  <button className="del" title="Remove game"
-                    aria-label={`Remove game ${at(g)} ${team.name} on ${fmtDate(g.date)}`}
-                    onClick={() => void removeGame(g.id)}>×</button>
-                </span>
-              </div>
-            );
-          })}
-          {!view.length && (
-            <p className="empty">{empty ? "Search above to log your first game." : "No games match this filter."}</p>
-          )}
         </div>
+        <div className="badges">
+          {(allBadges ? data.badges : earned).map((b) => (
+            <BadgePill key={b.key} b={b} pressed={filter.badge === b.key} onClick={() => toggle("badge", b.key)} />
+          ))}
+          <button className="badge" data-earned={0} onClick={() => setAllBadges((v) => !v)}>
+            ☆ {allBadges ? "Earned only" : "All badges"}
+          </button>
+        </div>
+        <p className="hint">Tap a badge or team to filter your games</p>
+      </header>
 
-        {!empty && (
-          <div className="pager">
-            <span className="count">
-              {list.length ? start + 1 : 0}-{showAll ? list.length : Math.min(start + PAGE, list.length)} of {list.length} games
-            </span>
-            <div className="pgbtns">
-              <button disabled={showAll || page === 0} onClick={() => setPage((p) => p - 1)}>Prev</button>
-              <button disabled={showAll || start + PAGE >= list.length} onClick={() => setPage((p) => p + 1)}>Next</button>
-              <button onClick={() => { setShowAll((v) => !v); setPage(0); }}>
-                {showAll ? "Show 25 per page" : "See all games"}
-              </button>
-              <button className="btn-solid" onClick={() => { setPrefill(null); setAdding((v) => !v); }}>
-                Add manually
-              </button>
+      <div className="cols2">
+        <section className="box">
+          <h2>Single Game Records</h2>
+          {data.records.map((r) => (
+            <div className="rec" key={r.label}>
+              <span className="k">{r.label}</span>
+              <span className="v"><b>{r.value}</b><small>{r.sub.replace(/\d{4}-\d{2}-\d{2}/, fmtDate)}</small></span>
             </div>
-          </div>
-        )}
+          ))}
+        </section>
 
-        {adding && (
-          <AddGame teams={data.teams} prefill={prefill}
-            onDone={() => { setAdding(false); setPrefill(null); }}
-            onSaved={() => { setAdding(false); setPrefill(null); void reload(); }} />
+        <section className="box">
+          <h2>Team Records</h2>
+          <div className="thead"><span>Team</span><span>W–L</span></div>
+          {teams.map((t) => (
+            <button className="tr" key={t.abbr} aria-pressed={filter.team === t.abbr} onClick={() => toggle("team", t.abbr)}>
+              <span><i style={{ background: t.color }} />{t.name}</span><u>{t.w}–{t.l}</u>
+            </button>
+          ))}
+          {data.teams.length > 15 && (
+            <button className="more" onClick={() => setAllTeams((v) => !v)}>
+              {allTeams ? "Show fewer" : `See all ${data.teams.length}`} →
+            </button>
+          )}
+        </section>
+      </div>
+
+      <div className="cols3">
+        <Ranked title="Arenas" head="Arena" col="Games"
+          rows={data.arenas.map((a) => ({ key: a.venue, label: <>{a.venue}<small>{a.city}</small></>, value: a.games }))} />
+
+        {data.leaders.map((b) => (
+          <Ranked key={b.key} title={b.label} head="Player" col={b.col}
+            rows={b.top.map((p) => ({ key: p.name, label: p.name, value: p.value }))} />
+        ))}
+
+        <section className="box">
+          <h2>Milestones</h2>
+          {data.milestones.map((m) => (
+            <div className={`tr${m.done ? "" : " locked"}`} key={m.title} title={m.detail}>
+              <span>{m.title}{m.detail && <small>{m.detail}</small>}</span>
+              <u>{isDate(m.mark) ? fmtDate(m.mark) : m.mark}</u>
+            </div>
+          ))}
+        </section>
+      </div>
+
+      <section className="band">
+        <h2>Been to a game recently?</h2>
+        <p>Find it and add it — the box score comes with it.</p>
+        {entering ? <GameSearch have={have} onAdd={add} /> : (
+          <button className="navy" onClick={() => setEntering(true)}>Enter Games</button>
         )}
       </section>
-    </div>
+
+      <section className="box" ref={gamesRef}>
+        <h2>Games ({list.length})</h2>
+        {(filter.badge || filter.team) && (
+          <div className="filterbar">
+            <span>
+              Showing {[filter.badge && data.badges.find((b) => b.key === filter.badge)?.label,
+                filter.team && data.teams.find((t) => t.abbr === filter.team)?.name].filter(Boolean).join(" + ")} games
+            </span>
+            <button className="link" onClick={() => setFilter({ badge: null, team: null })}>Clear</button>
+          </div>
+        )}
+        {showAll ? (
+          <>
+            <div className="years">
+              {years.map((y) => (
+                <button key={y} className="pill" onClick={() => document.getElementById(`y${y}`)?.scrollIntoView({ behavior: "smooth" })}>{y}</button>
+              ))}
+            </div>
+            {years.map((y) => {
+              const yearGames = list.filter((g) => g.date.startsWith(y));
+              return (
+                <div key={y} id={`y${y}`}>
+                  <h3 className="yr">{y} <small>{yearGames.length} game{yearGames.length === 1 ? "" : "s"}</small></h3>
+                  {yearGames.map((g) => row(g, false))}
+                </div>
+              );
+            })}
+          </>
+        ) : list.slice(0, PAGE).map((g) => row(g, true))}
+        {!list.length && <p className="muted center">No games match this filter.</p>}
+        {list.length > PAGE && (
+          <button className="more boxed" onClick={() => setShowAll((v) => !v)}>
+            {showAll ? "Show recent" : `See all ${list.length} games by year`} →
+          </button>
+        )}
+      </section>
+    </div></div>
   );
 }
 
 /* ---------- pieces ---------- */
 
-function Masthead({ handle, email, onRename }: { handle: string; email: string; onRename: (h: string) => void }) {
+type RankRow = { key: string; label: React.ReactNode; value: number };
+
+/** A top-5 table with a "See all" toggle: arenas and every player leader board. */
+function Ranked({ title, head, col, rows }: { title: string; head: string; col: string; rows: RankRow[] }) {
+  const [all, setAll] = useState(false);
   return (
-    <header className="masthead">
-      <h1>
-        <span id="handle" contentEditable suppressContentEditableWarning spellCheck={false} title="Click to rename"
-          onBlur={(e) => onRename(e.currentTarget.textContent ?? "")}
-          onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); e.currentTarget.blur(); } }}>
-          {handle}
-        </span>
-        <em>&rsquo;s</em> Games
-      </h1>
-      <div className="who">
-        <span className="sub">{email}</span>
-        <button className="btn" onClick={() => { location.hash = ""; void supabase.auth.signOut(); }}>Sign out</button>
-      </div>
-    </header>
+    <section className="box">
+      <h2>{title}</h2>
+      <div className="thead"><span>{head}</span><span>{col}</span></div>
+      {(all ? rows : rows.slice(0, 5)).map((r) => (
+        <div className="tr" key={r.key}><span>{r.label}</span><u>{r.value}</u></div>
+      ))}
+      {rows.length > 5 && (
+        <button className="more" onClick={() => setAll((v) => !v)}>{all ? "Top 5" : "See all"} →</button>
+      )}
+    </section>
   );
 }
 
-function GameSearch({ onPick }: { onPick: (p: Prefill) => void }) {
+const EXAMPLES = ["warriors 3/14", "lakers 12/25/25"];
+
+function GameSearch({ have, onAdd }: { have: Set<string>; onAdd: (id: string) => Promise<void> }) {
   const [q, setQ] = useState("");
   const [hits, setHits] = useState<Found[] | null>(null);
   const [busy, setBusy] = useState(false);
+  const [adding, setAdding] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
-  const run = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!q.trim()) return;
-    setBusy(true); setErr(null);
+  const run = async (query: string) => {
+    if (!query.trim()) return;
+    setQ(query); setBusy(true); setErr(null);
     try {
-      const { games } = await call<{ games: Found[] }>(`/search?q=${encodeURIComponent(q)}`);
-      setHits(games);
+      setHits((await call<{ games: Found[] }>(`/search?q=${encodeURIComponent(query)}`)).games);
     } catch (e) {
-      setErr((e as Error).message);
-      setHits(null);
+      setErr((e as Error).message); setHits(null);
     } finally {
       setBusy(false);
     }
   };
+  const add = async (id: string) => {
+    setAdding(id); setErr(null);
+    try { await onAdd(id); } catch (e) { setErr((e as Error).message); } finally { setAdding(null); }
+  };
 
   return (
     <div className="search">
-      <form onSubmit={(e) => void run(e)}>
-        <input value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search NBA game logs"
-          placeholder="warriors 3/14  ·  lakers 3/15/26  ·  12/25/25" />
-        <button className="btn btn-solid" type="submit" disabled={busy}>{busy ? "Searching…" : "Find games"}</button>
+      <form onSubmit={(e) => { e.preventDefault(); void run(q); }}>
+        <input value={q} onChange={(e) => setQ(e.target.value)} aria-label="Find a game you went to"
+          placeholder="Team and date, e.g. warriors 3/14" />
+        <button className="navy" type="submit" disabled={busy}>{busy ? "Searching…" : "Find Games"}</button>
       </form>
-      <p className="sub hint">
-        Team + date finds that matchup. A bare <code>3/14</code> checks that day across the last five
-        seasons; add a year to pin one. A date on its own lists every game that night.
+      <p className="try">
+        Try:{EXAMPLES.map((x) => <button key={x} type="button" className="pill" onClick={() => void run(x)}>{x}</button>)}
       </p>
 
-      {err && <p className="error">{err}</p>}
-      {hits && !hits.length && !err && <p className="empty">No games found for “{q}”.</p>}
-
+      {err && <p className="err">{err}</p>}
+      {hits && !hits.length && !err && <p className="muted center">No games found for “{q}”.</p>}
       {!!hits?.length && (
         <div className="results">
+          <p className="found">Found {hits.length === 1 ? "it" : `${hits.length} games`} — click + to add:</p>
           {hits.map((g) => (
-            <div className="result" key={`${g.date}-${g.label}`}>
-              <span className="dt">{fmtDate(g.date)}</span>
+            <div className="result" key={g.id}>
               <span className="match">
-                <b>{g.sides[1].name} @ {g.sides[0].name}</b>
-                <span className="sub">
-                  {g.final ? `Final ${g.sides[1].team_score}–${g.sides[0].team_score}` : "Not final"}
-                </span>
+                <small>{fmtDay(g.date)}, {g.date.slice(0, 4)}</small>
+                <Matchup g={g} />
               </span>
-              <span className="picks">
-                {g.sides.map((s) => (
-                  <button className="btn" key={s.abbr} onClick={() => onPick({ ...s, date: g.date })}>
-                    Log as {s.name}
-                  </button>
-                ))}
-              </span>
+              {have.has(g.id) ? <span className="added" title="Added">✓</span>
+                : g.final ? (
+                  <button className="plus" aria-label={`Add ${g.away.name} at ${g.home.name}`} disabled={adding === g.id}
+                    onClick={() => void add(g.id)}>{adding === g.id ? "…" : "+"}</button>
+                ) : <small>Not final</small>}
             </div>
           ))}
         </div>
       )}
     </div>
-  );
-}
-
-const FIELDS: [keyof Game & string, string][] = [
-  ["team_score", "Our Score"], ["opp_score", "Their Score"], ["min", "Minutes"],
-  ["pts", "PTS"], ["reb", "REB"], ["ast", "AST"], ["stl", "STL"], ["blk", "BLK"],
-  ["fg3m", "3PM"], ["fg3a", "3PA"], ["tov", "TO"],
-];
-
-function AddGame({ teams, prefill, onSaved, onDone }:
-  { teams: Summary["teams"]; prefill: Prefill | null; onSaved: () => void; onDone: () => void }) {
-  const [saving, setSaving] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-
-  const submit = async (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    const form = new FormData(e.currentTarget);
-    const row: Record<string, unknown> = {
-      date: form.get("date"), opp: form.get("opp"), home: form.get("home") === "1",
-    };
-    for (const [key] of FIELDS) row[key] = Number(form.get(key)) || 0;
-    row.fg3a = Math.max(row.fg3a as number, row.fg3m as number);
-    setSaving(true);
-    const { error } = await supabase.from("games").insert(row);
-    setSaving(false);
-    if (error) return setErr(error.message);
-    onSaved();
-  };
-
-  return (
-    <form className="add" onSubmit={(e) => void submit(e)}
-      key={prefill ? `${prefill.date}-${prefill.abbr}` : "blank"}>
-      {prefill && (
-        <p className="prefill">
-          Logging <b>{prefill.name}</b> {at(prefill)} {prefill.opp_name} · {fmtDate(prefill.date)} —
-          scores are filled in, add your own line.
-        </p>
-      )}
-      <label>Date<input type="date" name="date" required
-        defaultValue={prefill?.date ?? new Date().toISOString().slice(0, 10)} /></label>
-      <label>Opponent
-        <select name="opp" defaultValue={prefill?.opp ?? "BOS"}>
-          {teams.map((t) => <option key={t.abbr} value={t.abbr}>{t.name}</option>)}
-        </select>
-      </label>
-      <label>Venue
-        <select name="home" defaultValue={prefill && !prefill.home ? "0" : "1"}>
-          <option value="1">Home</option><option value="0">Away</option>
-        </select>
-      </label>
-      {FIELDS.map(([key, l]) => (
-        <label key={key}>{l}
-          <input type="number" name={key} min={0} max={300} required
-            defaultValue={key === "team_score" ? prefill?.team_score ?? 0
-              : key === "opp_score" ? prefill?.opp_score ?? 0 : 0} />
-        </label>
-      ))}
-      <div className="actions">
-        <button className="btn btn-solid" type="submit" disabled={saving}>{saving ? "Saving…" : "Save game"}</button>
-        <button className="btn" type="button" onClick={onDone}>Cancel</button>
-        {err && <span className="sub" style={{ color: "var(--loss)" }}>{err}</span>}
-      </div>
-    </form>
   );
 }
