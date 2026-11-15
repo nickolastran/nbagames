@@ -1,24 +1,20 @@
 # NBA Game Tracker
 
-Log your own stat line against real NBA games. Sign in with Supabase, search the league's
-game logs by keyword, pick the side you played, and add your box score.
+A personal scoreboard for every NBA game you've been to. Search for a game, hit **+**, and its
+real box score comes with it — final score, overtimes, arena, every player's line. Your stats
+build from those: team records, single-game records, player leader boards across your games,
+arenas, milestones, and badges for rare stuff you witnessed (each with roughly how rare it is).
 
-`/` is a landing page — a three.js shot loop, the pitch, and a footer mark linking to the
-repo. `#login` is the sign-in route; once you have a session you land in the tracker.
-**Set `REPO` at the top of `web/src/Landing.tsx` to your GitHub URL** — it ships as a
-placeholder.
+No account: games are saved in your browser (localStorage). Use **Export** / **Import** in the
+tracker to back them up or move devices.
 
-FastAPI + React/TypeScript. Games live in Supabase (Postgres + row-level security); the API
-is stateless — it computes every derived stat (accolades, records, splits, leaders,
-milestones) so the client never re-implements them, and proxies the game-log search.
+`/` is a landing page — a three.js shot loop, the pitch, and a footer mark linking to the repo.
+`#app` is the tracker. **Set `REPO` at the top of `web/src/Landing.tsx` to your GitHub URL** —
+it ships as a placeholder.
 
-## Setup
-
-1. **Supabase** — create a project, run `supabase/schema.sql` in the SQL editor. It creates
-   the `games` table and an RLS policy so each account only ever sees its own rows.
-   To skip the confirmation email, turn off *Confirm email* under Authentication → Providers.
-2. **Keys** — `cp web/.env.example web/.env.local` and paste the project URL + anon key
-   from Project Settings → API.
+FastAPI + React/TypeScript. The API is stateless — it computes every derived stat from the
+games the browser posts, and proxies ESPN's public scoreboard (search) and box scores (adding).
+No database, no keys.
 
 ## Run
 
@@ -39,8 +35,7 @@ Production: `cd web && npm run build`, then `uvicorn api.main:app` serves `web/d
 | `12/25/25` | every game that night |
 | `golden state 12/25/24` | city, nickname or abbreviation all match |
 
-A date is required. Data comes from ESPN's public scoreboard — no API key, cached per day.
-Picking a side prefills the date, opponent, venue and final score; you fill in your own line.
+A date is required. Data comes from ESPN's public API — no key, cached per day / per game.
 
 ## Check
 
@@ -54,5 +49,6 @@ cd web && npm run build                        # typechecks, then bundles
 
 | | |
 |---|---|
-| `POST /api/summary` | `{handle, games[], acc?, team?}` → everything the page renders |
-| `GET /api/search?q=` | keyword search over NBA game logs |
+| `GET /api/search?q=` | keyword search over NBA scoreboards |
+| `GET /api/game/{id}` | one finished game's box score, in the shape the browser stores |
+| `POST /api/summary` | `{games[], badge?, team?}` → everything the page renders |
