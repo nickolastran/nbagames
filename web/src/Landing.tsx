@@ -4,10 +4,12 @@ const Hoop = lazy(() => import("./Hoop")); // keeps three.js out of the signed-i
 
 export const REPO = "https://github.com/your-handle/nbagames"; // ← point this at your repo
 
-export const Ball = ({ size = 22 }: { size?: number }) => (
-  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.4">
-    <circle cx="12" cy="12" r="10" />
-    <path d="M2 12h20M12 2v20M4.9 4.9c4 3.2 4 10.9 0 14.2M19.1 4.9c-4 3.2-4 10.9 0 14.2" />
+/** The Game Tracker mark — same art as public/favicon.svg. */
+export const Ball = ({ size = 26 }: { size?: number }) => (
+  <svg width={size} height={size} viewBox="0 0 32 32" aria-hidden="true">
+    <rect x="1" y="1" width="30" height="30" rx="7" fill="#1f3527" stroke="#e3b347" strokeWidth="1.5" />
+    <circle cx="16" cy="16" r="9.5" fill="#e3b347" />
+    <path d="M6.5 16h19M16 6.5v19M9.3 9.3c3.6 3.4 3.6 10 0 13.4M22.7 9.3c-3.6 3.4-3.6 10 0 13.4" fill="none" stroke="#1f3527" strokeWidth="1.5" />
   </svg>
 );
 
