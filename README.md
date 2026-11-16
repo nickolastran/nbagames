@@ -19,6 +19,12 @@ No database, no keys.
 ## Run
 
 ```bash
+./dev.sh   # installs on first run, then API on :8000 + UI on :5173; Ctrl-C stops both
+```
+
+Or each on its own:
+
+```bash
 python3 -m venv .venv && .venv/bin/pip install -r api/requirements.txt
 .venv/bin/uvicorn api.main:app --reload --port 8000   # API on :8000
 cd web && npm install && npm run dev                  # UI on :5173, proxies /api to :8000
@@ -30,7 +36,7 @@ Production: `cd web && npm run build`, then `uvicorn api.main:app` serves `web/d
 
 | Query | Finds |
 |---|---|
-| `warriors 3/14` | every Warriors game on March 14, last five seasons |
+| `warriors 3/14` | the 10 most recent Warriors games on March 14 (back to 1993) |
 | `lakers 3/15/26` | that one game |
 | `12/25/25` | every game that night |
 | `golden state 12/25/24` | city, nickname or abbreviation all match |
@@ -52,3 +58,4 @@ cd web && npm run build                        # typechecks, then bundles
 | `GET /api/search?q=` | keyword search over NBA scoreboards |
 | `GET /api/game/{id}` | one finished game's box score, in the shape the browser stores |
 | `POST /api/summary` | `{games[], badge?, team?}` → everything the page renders |
+| `POST /api/players` | `{games[]}` → every player's totals and game log, for the "See all" tables |
