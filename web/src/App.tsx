@@ -8,6 +8,7 @@ type Side = { abbr: string; name: string; score: number };
 type Stored = {
   id: string; date: string; playoff: boolean; periods: number; venue: string; city: string;
   home: Side; away: Side; players: unknown[];
+  milestones?: unknown[] | null; // career marks; missing on games stored before they existed
 };
 type Seen = Stored & { badges: string[] };
 type Badge = { key: string; label: string; rarity: number | null; count: number; progress?: string | null };
@@ -16,9 +17,10 @@ type Summary = {
   totals: { games: number; points: number; players: number; teams: number; arenas: number };
   badges: Badge[];
   records: { label: string; value: string; sub: string }[];
-  teams: { abbr: string; name: string; color: string; w: number; l: number; games: number }[];
+  teams: { abbr: string; name: string; color: string; logo: string; w: number; l: number; games: number }[];
   arenas: { venue: string; city: string; games: number }[];
   leaders: Board[];
+  badge_years: { year: string; badges: { key: string; count: number; new: boolean }[] }[];
   milestones: { title: string; done: boolean; mark: string; detail: string }[];
   games: Seen[];
 };
@@ -73,9 +75,10 @@ function useHash() {
   return hash;
 }
 
-/** "#app" is the tracker; everything else (including in-page anchors) is the landing page. */
+/** "#app" is the tracker, "#players/…" the full player tables; everything else (including in-page anchors) is the landing page. */
 export default function App() {
-  return useHash() === "app" ? <Tracker /> : <Landing />;
+  const hash = useHash();
+  return hash === "app" ? <Tracker /> : hash.startsWith("players/") ? <PlayerStats route={hash} /> : <Landing />;
 }
 
 const Title = ({ handle, onClick }: { handle: string; onClick: () => void }) => (
@@ -135,6 +138,21 @@ function Tracker() {
       .catch((e: Error) => { if (live) setError(e.message); });
     return () => { live = false; };
   }, [store.games, filter]);
+
+  // games saved before career milestones existed: fetch them again, one at a time, in the background
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      for (const id of store.games.filter((g) => !g.milestones).map((g) => g.id)) {
+        if (!live) return;
+        try {
+          const g = await call<Stored>(`/game/${id}`);
+          if (live && g.milestones) setStore((s) => ({ ...s, games: s.games.map((x) => (x.id === id ? g : x)) }));
+        } catch { /* ESPN unreachable: try again next visit */ }
+      }
+    })();
+    return () => { live = false; };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps -- once per visit
 
   const have = new Set(store.games.map((g) => g.id));
   const add = async (id: string) => {
@@ -283,7 +301,7 @@ function Tracker() {
           <div className="thead"><span>Team</span><span>W–L</span></div>
           {teams.map((t) => (
             <button className="tr" key={t.abbr} aria-pressed={filter.team === t.abbr} onClick={() => toggle("team", t.abbr)}>
-              <span><i style={{ background: t.color }} />{t.name}</span><u>{t.w}–{t.l}</u>
+              <span><img src={t.logo} alt="" loading="lazy" />{t.name}</span><u>{t.w}–{t.l}</u>
             </button>
           ))}
           {data.teams.length > 15 && (
@@ -299,7 +317,7 @@ function Tracker() {
           rows={data.arenas.map((a) => ({ key: a.venue, label: <>{a.venue}<small>{a.city}</small></>, value: a.games }))} />
 
         {data.leaders.map((b) => (
-          <Ranked key={b.key} title={b.label} head="Player" col={b.col}
+          <Ranked key={b.key} title={b.label} head="Player" col={b.col} href={`#players/${b.key}`}
             rows={b.top.map((p) => ({ key: p.name, label: p.name, value: p.value }))} />
         ))}
 
@@ -313,6 +331,35 @@ function Tracker() {
           ))}
         </section>
       </div>
+
+      {!!data.badge_years.length && (
+        <section className="box byyear">
+          <h2>Badges by Year</h2>
+          <p className="muted">Gold badges were earned for the first time that year.</p>
+          <div className="years">
+            {data.badge_years.map(({ year }) => (
+              <button key={year} className="pill" onClick={() => document.getElementById(`b${year}`)?.scrollIntoView({ behavior: "smooth" })}>{year}</button>
+            ))}
+          </div>
+          {data.badge_years.map(({ year, badges }) => {
+            const fresh = badges.filter((b) => b.new), again = badges.filter((b) => !b.new);
+            const pills = (list: typeof badges) => (
+              <div className="badges">{list.map((x) => {
+                const b = data.badges.find((d) => d.key === x.key)!;
+                return <BadgePill key={x.key} b={{ ...b, count: x.count }} pressed={filter.badge === x.key}
+                  onClick={() => toggle("badge", x.key)} />;
+              })}</div>
+            );
+            return (
+              <div key={year} id={`b${year}`} className="yrbadges">
+                <h3 className="yr">{year} <small>{[fresh.length && `${fresh.length} new`, again.length && `${again.length} seen again`].filter(Boolean).join(" · ")}</small></h3>
+                {!!fresh.length && <><p className="lbl">First earned</p><div data-new="1">{pills(fresh)}</div></>}
+                {!!again.length && <><p className="lbl">Seen again</p><div data-new="0">{pills(again)}</div></>}
+              </div>
+            );
+          })}
+        </section>
+      )}
 
       <section className="band">
         <h2>Been to a game recently?</h2>
@@ -362,12 +409,100 @@ function Tracker() {
   );
 }
 
+/* ---------- player tables: the leader boards' "See all" ---------- */
+
+type Line = { id: string; name: string; team: string; min: number; pts: number; reb: number; ast: number; stl: number; blk: number; fg3m: number };
+type Total = Line & { games: number };
+type LogRow = Line & { game: string; date: string; away: string; home: string; result: string };
+type PlayersOut = { games: number; totals: Total[]; log: LogRow[] };
+type Col = { key: string; label: string; text?: boolean; cell?: (r: Total & LogRow) => React.ReactNode };
+
+const STATS: Col[] = [["min", "MIN"], ["pts", "PTS"], ["reb", "REB"], ["ast", "AST"], ["stl", "STL"], ["blk", "BLK"], ["fg3m", "3PM"]]
+  .map(([key, label]) => ({ key, label }));
+
+/** "#players/fg3m" totals sorted by 3PM · "#players/fg3m/log" every player line · "#players/fg3m/<player id>" one player's games. */
+function PlayerStats({ route }: { route: string }) {
+  const [, stat = "pts", view = ""] = route.split("/");
+  const [data, setData] = useState<PlayersOut | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [sort, setSort] = useState({ key: stat, desc: true });
+
+  useEffect(() => { scrollTo(0, 0); }, [view]);
+  useEffect(() => {
+    call<PlayersOut>("/players", { method: "POST", body: JSON.stringify({ games: loadStore().games }) })
+      .then(setData).catch((e: Error) => setError(e.message));
+  }, []);
+
+  const player = view && view !== "log" ? data?.totals.find((t) => t.id === view) : undefined;
+  const isLog = !!view;
+  const nameCol: Col = { key: "name", label: "Player", text: true, cell: (r) => <a href={`#players/${sort.key}/${r.id}`}>{r.name}</a> };
+  const cols: Col[] = isLog
+    ? [...(player ? [] : [nameCol]),
+       { key: "date", label: "Game", text: true, cell: (r) => <>{fmtDate(r.date)}<small>
+         {r.away === r.team ? <b>{r.away}</b> : r.away}@{r.home === r.team ? <b>{r.home}</b> : r.home}</small></> },
+       { key: "result", label: "Result", text: true }, ...STATS]
+    : [nameCol, { key: "team", label: "Team", text: true }, { key: "games", label: "G" }, ...STATS];
+  const rows = ((isLog ? data?.log.filter((r) => !player || r.id === player.id) : data?.totals) ?? []) as (Total & LogRow)[];
+  const val = (r: Total & LogRow, k: string) => (r as unknown as Record<string, string | number>)[k];
+  const sorted = [...rows].sort((a, b) => {
+    const x = val(a, sort.key), y = val(b, sort.key);
+    return (x < y ? -1 : x > y ? 1 : 0) * (sort.desc ? -1 : 1);
+  });
+  const by = (key: string) => setSort((s) => ({ key, desc: s.key === key ? !s.desc : !["name", "team"].includes(key) }));
+  const sortLabel = cols.find((c) => c.key === sort.key)?.label ?? sort.key;
+
+  return (
+    <div className="app"><div className="page">
+      <nav className="topbar">
+        <a href="#app" className="logo"><Ball /><span>Game<b>Tracker</b></span></a>
+        <span className="tools"><a className="ghost" href="#app">← My games</a></span>
+      </nav>
+      {error && <p className="err">{error}</p>}
+      {data && (
+        <section className="box">
+          <h2>{player ? player.name : "Player Stats"}</h2>
+          <div className="statbar">
+            <span>
+              {player ? <>{player.team} · {player.games} game{player.games === 1 ? "" : "s"} you were at · </>
+                : <>From your {data.games} game{data.games === 1 ? "" : "s"} · </>}
+              sorted by {sortLabel} · {sorted.length} result{sorted.length === 1 ? "" : "s"}
+            </span>
+            <span className="views">
+              {player ? <a href={`#players/${sort.key}`}>← All players</a> : <>
+                <a href={`#players/${sort.key}`} aria-current={!isLog}>Totals</a>
+                <a href={`#players/${sort.key}/log`} aria-current={isLog}>Game log</a>
+              </>}
+            </span>
+          </div>
+          {sorted.length ? (
+            <div className="scroll">
+              <table className="stats">
+                <thead><tr>{cols.map((c) => (
+                  <th key={c.key} className={c.text ? "l" : undefined} aria-sort={sort.key === c.key ? (sort.desc ? "descending" : "ascending") : undefined}>
+                    <button onClick={() => by(c.key)}>{c.label}{sort.key === c.key && (sort.desc ? " ▾" : " ▴")}</button>
+                  </th>
+                ))}</tr></thead>
+                <tbody>{sorted.map((r) => (
+                  <tr key={isLog ? `${r.game}-${r.id}` : r.id}>
+                    {cols.map((c) => <td key={c.key} className={c.text ? "l" : undefined} data-on={sort.key === c.key ? 1 : 0}>{c.cell ? c.cell(r) : val(r, c.key)}</td>)}
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+          ) : <p className="muted center">No player stats yet — <a href="#app">add a game</a> first.</p>}
+        </section>
+      )}
+      {!data && !error && <p className="muted center">Loading…</p>}
+    </div></div>
+  );
+}
+
 /* ---------- pieces ---------- */
 
 type RankRow = { key: string; label: React.ReactNode; value: number };
 
-/** A top-5 table with a "See all" toggle: arenas and every player leader board. */
-function Ranked({ title, head, col, rows }: { title: string; head: string; col: string; rows: RankRow[] }) {
+/** A top-5 table. "See all" expands it in place, or with `href` goes to the full player tables. */
+function Ranked({ title, head, col, rows, href }: { title: string; head: string; col: string; rows: RankRow[]; href?: string }) {
   const [all, setAll] = useState(false);
   return (
     <section className="box">
@@ -376,9 +511,8 @@ function Ranked({ title, head, col, rows }: { title: string; head: string; col: 
       {(all ? rows : rows.slice(0, 5)).map((r) => (
         <div className="tr" key={r.key}><span>{r.label}</span><u>{r.value}</u></div>
       ))}
-      {rows.length > 5 && (
-        <button className="more" onClick={() => setAll((v) => !v)}>{all ? "Top 5" : "See all"} →</button>
-      )}
+      {href ? <a className="more" href={href}>See all →</a>
+        : rows.length > 5 && <button className="more" onClick={() => setAll((v) => !v)}>{all ? "Top 5" : "See all"} →</button>}
     </section>
   );
 }
