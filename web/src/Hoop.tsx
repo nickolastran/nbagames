@@ -99,7 +99,7 @@ export default function Hoop() {
 
     const arm = new THREE.Mesh(
       new THREE.BoxGeometry(0.16, 0.16, 0.95),
-      new THREE.MeshStandardMaterial({ color: 0x38301e, roughness: 0.6 }),
+      new THREE.MeshStandardMaterial({ color: 0x3d5a46, roughness: 0.6 }),
     );
     arm.position.set(0, RIM_Y, -0.6);
     scene.add(arm);
